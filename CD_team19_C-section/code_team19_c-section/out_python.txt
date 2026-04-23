@@ -1,0 +1,64 @@
+python : WARNING: Token 
+'COMMA' defined, but not 
+used
+At line:1 char:1
++ python test_runner.py > 
+out.txt 2>&1
++ ~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~
+    + CategoryInfo        
+      : NotSpecified: (W  
+  ARNING: Token ...d, b   
+ ut not used:String) [    
+], RemoteException
+    + FullyQualifiedError 
+   Id : NativeCommandErr  
+  or
+ 
+WARNING: Token 'FOR' 
+defined, but not used
+WARNING: There are 2 
+unused tokens
+Testing...
+TRIGGER 2: Inline Drop -> d = 5 * 0
+TRIGGER 2: Inline Drop -> e = 10 + 20
+TRIGGER 2: Inline Drop -> g = c + 0
+TRIGGER 2: Inline Drop -> h = c * 1
+TRIGGER 2: Inline Drop -> i = c - 0
+TRIGGER 2: Inline Drop -> j = c / 1
+TRIGGER 2: Inline Drop -> k = 0 * c
+TRIGGER 2: Inline Drop -> l = 0 + c
+TRIGGER 2: Inline Drop -> f = t9 * t10
+TRIGGER 2: Inline Drop -> m = e + f
+TRIGGER 2: Inline Drop -> n = m * 1
+TRIGGER 2: Inline Drop -> t1 = 3 * 2
+TRIGGER 2: Inline Drop -> t3 = 2 * 2
+TRIGGER 2: Inline Drop -> q = o + 0
+TRIGGER 2: Inline Drop -> v = c / a
+TRIGGER 2: Inline Drop -> y = x + 0
+TRIGGER 2: Inline Drop -> z = t23 + t24
+TRIGGER 2: Inline Drop -> w = z * 1
+TRIGGER 4: Boolean True Drop -> ifFalse t15 goto L3
+TRIGGER 3: Boolean False Fold -> ifFalse t17 goto L6
+TRIGGER 4: Boolean True Drop -> ifFalse t19 goto L9
+TRIGGER 5: Orphan Label -> L3:
+TRIGGER 6: Unreachable Logic -> o = 200
+TRIGGER 6: Unreachable Logic -> p = 1
+TRIGGER 6: Unreachable Logic -> goto L5
+TRIGGER 5: Orphan Label -> L9:
+TRIGGER 6: Unreachable Logic -> u = 999
+TRIGGER 7: Dead Store Elim -> t24 = 0
+TRIGGER 7: Dead Store Elim -> t23 = 5
+TRIGGER 7: Dead Store Elim -> t22 = 5
+TRIGGER 7: Dead Store Elim -> x = 10
+TRIGGER 7: Dead Store Elim -> t19 = 1
+TRIGGER 7: Dead Store Elim -> t5 = 1
+TRIGGER 7: Dead Store Elim -> t17 = 0
+TRIGGER 7: Dead Store Elim -> t3 = 4
+TRIGGER 7: Dead Store Elim -> t15 = 1
+TRIGGER 7: Dead Store Elim -> t1 = 6
+TRIGGER 7: Dead Store Elim -> t10 = 3
+TRIGGER 7: Dead Store Elim -> t9 = 5
+TRIGGER 1: Jump Drop -> goto L2
+TRIGGER 1: Jump Drop -> goto L6
+TRIGGER 1: Jump Drop -> goto L8
