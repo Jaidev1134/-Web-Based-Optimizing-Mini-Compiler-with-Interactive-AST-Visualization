@@ -540,6 +540,24 @@ class GraphColoringAllocator:
         self.spilled = set()
         self.interference = {}
         self.ops = {'+', '-', '*', '/', '^', '<', '>', '<=', '>=', '==', '!=', 'call'}
+
+    @staticmethod
+    def is_valid_var(v):
+        """Return True only for proper identifiers (variable/temp names).
+        Rejects numeric literals, string literals, operators, and keywords."""
+        if not v:
+            return False
+        # Reject numeric literals (int or float)
+        try:
+            float(v)
+            return False
+        except ValueError:
+            pass
+        # Reject string literals (quoted values)
+        if v.startswith('"') or v.startswith("'"):
+            return False
+        # Must be a valid Python identifier (covers a-z, A-Z, _, digits after first char)
+        return v.isidentifier()
         
     def allocate(self):
         succs = {i: set() for i in range(len(self.tac_list))}
@@ -567,19 +585,24 @@ class GraphColoringAllocator:
             u, d = set(), set()
             parts = line.split(" ")
             if len(parts) >= 3 and parts[1] == '=':
-                d.add(parts[0])
+                if self.is_valid_var(parts[0]):
+                    d.add(parts[0])
                 for j in range(2, len(parts)):
                     try: float(parts[j])
                     except ValueError:
                         val = parts[j].replace(',', '')
-                        if val not in self.ops and val not in ['call', 'sin', 'cos', 'sqrt']:
+                        if val not in self.ops and val not in ['call', 'sin', 'cos', 'sqrt'] and self.is_valid_var(val):
                             u.add(val)
             elif line.startswith("ifFalse "):
                 try: float(parts[1])
-                except ValueError: u.add(parts[1])
+                except ValueError:
+                    if self.is_valid_var(parts[1]):
+                        u.add(parts[1])
             elif line.startswith("return "):
                 try: float(parts[1])
-                except ValueError: u.add(parts[1])
+                except ValueError:
+                    if self.is_valid_var(parts[1]):
+                        u.add(parts[1])
             USE[i] = u
             DEF[i] = d
 
@@ -604,14 +627,20 @@ class GraphColoringAllocator:
                     changed = True
 
         for u_set in USE.values():
-            for v in u_set: self.interference.setdefault(v, set())
+            for v in u_set:
+                if self.is_valid_var(v):
+                    self.interference.setdefault(v, set())
         for d_set in DEF.values():
-            for v in d_set: self.interference.setdefault(v, set())
+            for v in d_set:
+                if self.is_valid_var(v):
+                    self.interference.setdefault(v, set())
             
         for i in range(len(self.tac_list)):
             for d in DEF[i]:
+                if not self.is_valid_var(d):
+                    continue
                 for l in OUT[i]:
-                    if d != l:
+                    if d != l and self.is_valid_var(l):
                         self.interference[d].add(l)
                         self.interference.setdefault(l, set()).add(d)
 
@@ -621,29 +650,59 @@ class GraphColoringAllocator:
         is_temp = lambda v: v.startswith('t') and (v[1:].isdigit() or v.startswith('t_hoist_'))
         get_k = lambda v: 7 if is_temp(v) else self.k
         
+        def current_degree(n):
+            """Number of neighbors still in the uncolored set."""
+            return len([x for x in self.interference[n] if x in uncolored])
+        
+        # --- Phase 1: Simplify (push to stack) ---
         while uncolored:
-            candidates = [n for n in uncolored if len([x for x in self.interference[n] if x in uncolored]) < get_k(n)]
+            candidates = [n for n in uncolored if current_degree(n) < get_k(n)]
             if candidates:
+                # Pick highest-degree candidate first for better distribution
+                candidates.sort(key=lambda n: current_degree(n), reverse=True)
                 node = candidates[0]
                 uncolored.remove(node)
                 stack.append(node)
             else:
-                spill_candidate = max(uncolored, key=lambda n: len([x for x in self.interference[n] if x in uncolored]))
+                # Spill heuristic: prefer spilling temps over user vars;
+                # among equals, spill the highest-degree node
+                def spill_priority(n):
+                    return (not is_temp(n), current_degree(n))
+                spill_candidate = max(uncolored, key=spill_priority)
                 uncolored.remove(spill_candidate)
                 stack.append(spill_candidate)
 
         available_colors_s = [f"$s{i}" for i in range(self.k)]
         available_colors_t = [f"$t{i}" for i in range(7)]
         
+        # Track next rotation index per pool to avoid $s0/$t0 clustering
+        self._next_s = 0
+        self._next_t = 0
+        
+        # --- Phase 2: Select (assign registers) ---
         while stack:
             n = stack.pop()
             neighbor_colors = {self.reg_map[neighbor] for neighbor in self.interference[n] if neighbor in self.reg_map}
             color = None
             pool = available_colors_t if is_temp(n) else available_colors_s
-            for c in pool:
+            pool_size = len(pool)
+            
+            # Determine rotation start index for this pool
+            start = self._next_t if is_temp(n) else self._next_s
+            
+            # Cyclic rotation: walk the pool starting from the rotation index
+            # to distribute variables evenly across available registers
+            for offset in range(pool_size):
+                c = pool[(start + offset) % pool_size]
                 if c not in neighbor_colors:
                     color = c
+                    # Advance rotation so next variable starts at the next slot
+                    if is_temp(n):
+                        self._next_t = (start + offset + 1) % pool_size
+                    else:
+                        self._next_s = (start + offset + 1) % pool_size
                     break
+            
             if color:
                 self.reg_map[n] = color
             else:
@@ -864,11 +923,6 @@ class CompilerEngine:
                     aliases.clear()
             
             skip_propagation = False
-            if len(parts) >= 5 and parts[3] == '/':
-                val_right = parts[4]
-                if val_right == '0' or (val_right in constants and constants[val_right] == 0):
-                    skip_propagation = True
-
             start_idx = 2 if (len(parts) >= 2 and parts[1] == '=') else 0
             if not skip_propagation:
                 for i in range(start_idx, len(parts)):
@@ -901,15 +955,14 @@ class CompilerEngine:
                 except ValueError: is_right_const = False
                 op = parts[3]
                 
-                # Constant Folding
-                if is_left_const and is_right_const:
+                # Constant Folding — but NEVER fold division; keep it symbolic
+                # so that runtime divide-by-zero is not masked.
+                if is_left_const and is_right_const and op != '/':
                     res = None
                     left = float(parts[2]); right = float(parts[4])
                     if op == '+': res = left + right
                     elif op == '-': res = left - right
                     elif op == '*': res = left * right
-                    elif op == '/': 
-                        if right != 0: res = left / right
                     elif op == '==': res = 1 if left == right else 0
                     elif op == '!=': res = 1 if left != right else 0
                     elif op == '<':  res = 1 if left < right else 0
@@ -1045,23 +1098,33 @@ class CompilerEngine:
     def _pass_strength_reduction(self, tac):
         changed = False
         new_tac = []
+        
+        def _is_numeric(s):
+            try: float(s); return True
+            except ValueError: return False
+        
+        def _num_eq(s, val):
+            """Check if string s represents the numeric value val."""
+            try: return float(s) == val
+            except ValueError: return False
+        
         for line in tac:
             parts = line.split(" ")
             if len(parts) == 5 and parts[1] == '=':
                 dest, op, left, right = parts[0], parts[3], parts[2], parts[4]
-                # x * 2 -> x + x
-                if op == '*' and right == '2' and left.replace('.','',1).isdigit() == False:
+                # x * 2 -> x + x  (only when x is not a literal)
+                if op == '*' and _num_eq(right, 2) and not _is_numeric(left):
                     new_tac.append(f"{dest} = {left} + {left}")
                     changed = True; continue
-                elif op == '*' and left == '2' and right.replace('.','',1).isdigit() == False:
+                elif op == '*' and _num_eq(left, 2) and not _is_numeric(right):
                     new_tac.append(f"{dest} = {right} + {right}")
                     changed = True; continue
                 # x ^ 2 -> x * x
-                elif op == '^' and right == '2':
+                elif op == '^' and _num_eq(right, 2):
                     new_tac.append(f"{dest} = {left} * {left}")
                     changed = True; continue
-                # x / 1 -> x (handled generally by algebraic, but keeping strict strength reduction)
-                elif op == '/' and right == '1':
+                # x / 1 -> x
+                elif op == '/' and _num_eq(right, 1):
                     new_tac.append(f"{dest} = {left}")
                     changed = True; continue
             new_tac.append(line)
@@ -1075,9 +1138,16 @@ class CompilerEngine:
         for line in tac:
             parts = line.split(" ")
             
-            # Reset on Basic Block boundaries
-            if line.endswith(":") or line.startswith("goto") or line.startswith("ifFalse"):
+            # Reset only at basic block entry points (labels).
+            # Jumps end a block but expressions computed before the jump
+            # are still valid for instructions between the last label and
+            # the jump, so we keep the table alive through them.
+            if line.endswith(":"):
                 available_expr.clear()
+                new_tac.append(line)
+                continue
+            
+            if line.startswith("goto") or line.startswith("ifFalse"):
                 new_tac.append(line)
                 continue
                 
@@ -1180,7 +1250,26 @@ class CompilerEngine:
         
         if licm_changed:
             opt_tac = cfg.flatten()
-            # Clean up one last time after LICM might have hoisted things
+            # Run forward optimizations to convergence so that hoisted
+            # constant expressions (e.g. a=2, b=3, q=a+b -> q=5) are fully
+            # folded after CFG flattening
+            post_changed = True
+            while post_changed:
+                post_changed = False
+                c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_temporary_inlining(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_strength_reduction(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_forward_optimizations(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_local_cse(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_unreachable_code(opt_tac)
+                post_changed = post_changed or c
+                c, opt_tac = self._pass_dead_store_elimination(opt_tac)
+                post_changed = post_changed or c
             c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
             c, opt_tac = self._pass_unused_labels(opt_tac)
 
@@ -1307,9 +1396,12 @@ def compile_code(source_code, k_regs=4):
     
     asm.append(f"// --- Register Allocation (K={k_regs}) ---")
     for v, r in reg_map.items():
-        asm.append(f"// {v} -> {r}")
+        if GraphColoringAllocator.is_valid_var(v):
+            asm.append(f"// {v} -> {r}")
     if allocator.spilled:
-        asm.append(f"// Spilled: {', '.join(allocator.spilled)}")
+        valid_spilled = [s for s in allocator.spilled if GraphColoringAllocator.is_valid_var(s)]
+        if valid_spilled:
+            asm.append(f"// Spilled: {', '.join(valid_spilled)}")
     asm.append("// ---------------------------")
     
     # Temp registers for spilled/constants
@@ -1336,68 +1428,115 @@ def compile_code(source_code, k_regs=4):
             return [f"SW {s_reg}, {v}"] # Spill Store
 
     OUT = allocator.out_sets
+    val_constants = {}  # track compile-time constant values
+    div_label_num = 0
+
     for i, line in enumerate(opt_tac):
         line_clean = line.split("  //")[0].strip()
         parts = line_clean.split(" ")
-        
+
         if line_clean.endswith(":"):
             asm.append(line_clean)
-        
+            val_constants.clear()
+
         elif len(parts) == 3 and parts[1] == "=":
             src, loads = get_read_op(parts[2], TEMP1)
             asm.extend(loads)
             stores = get_write_op(parts[0], src)
             asm.extend(stores)
-            
+            # Track constant value for folding
+            try:
+                val_constants[parts[0]] = float(parts[2])
+            except ValueError:
+                val_constants.pop(parts[0], None)
+
         elif len(parts) >= 5 and parts[1] == "=":
             if len(parts) >= 5 and parts[2] == "call":
                 arg, loads = get_read_op(parts[4], TEMP1)
                 asm.extend(loads)
-                
+
                 # Caller-Save active $t variables across JAL
                 live_t_regs = set()
                 if i in OUT:
                     for v in OUT[i]:
                         if v in reg_map and reg_map[v].startswith("$t"):
                             live_t_regs.add(reg_map[v])
-                
+
                 # Push
                 for tr in live_t_regs:
                     asm.append(f"ADDI $sp, $sp, -4")
                     asm.append(f"SW {tr}, 0($sp)")
-                    
+
                 asm.append(f"MOVE $a0, {arg}")
                 asm.append(f"JAL {parts[3].replace(',','')}")
-                
+
                 # Pop
                 for tr in reversed(list(live_t_regs)):
                     asm.append(f"LW {tr}, 0($sp)")
                     asm.append(f"ADDI $sp, $sp, 4")
-                
+
                 stores = get_write_op(parts[0], "$v0")
                 asm.extend(stores)
+                val_constants.pop(parts[0], None)
             else:
                 op_map = {'+': 'ADD', '-': 'SUB', '*': 'MUL', '/': 'DIV', '<': 'SLT', '>': 'SGT', '==': 'SEQ', '!=': 'SNE'}
                 r_left, loads1 = get_read_op(parts[2], TEMP1)
                 r_right, loads2 = get_read_op(parts[4], TEMP2)
-                
+
                 asm.extend(loads1)
                 asm.extend(loads2)
-                
+
                 dest_reg = reg_map.get(parts[0], TEMP3)
                 op = op_map.get(parts[3], f"OP_{parts[3]}")
+
+                # DIV: always runtime-safe — single consistent pattern
+                if op == 'DIV':
+                    div_label_num += 1
+                    div_lbl = f"DIV_ZERO_{div_label_num}"
+                    cont_lbl = f"DIV_CONT_{div_label_num}"
+                    den_reg = r_right
+                    asm.append(f"BEQ {den_reg}, $zero, {div_lbl}")
+                    asm.append(f"DIV {dest_reg}, {r_left}, {r_right}")
+                    asm.append(f"J {cont_lbl}")
+                    asm.append(f"{div_lbl}:")
+                    asm.append(f"LI {dest_reg}, 0")
+                    asm.append(f"{cont_lbl}:")
+                    if parts[0] not in reg_map:
+                        asm.append(f"SW {dest_reg}, {parts[0]}")
+                    val_constants.pop(parts[0], None)
+                    continue
+
                 asm.append(f"{op} {dest_reg}, {r_left}, {r_right}")
-                
+
                 if parts[0] not in reg_map:
                     asm.append(f"SW {dest_reg}, {parts[0]}")
+
+                # Track constant result for constant operands (for final forward fold)
+                try:
+                    left_val = float(parts[2])
+                    right_val = float(parts[4])
+                    if op == 'ADD': res = left_val + right_val
+                    elif op == 'SUB': res = left_val - right_val
+                    elif op == 'MUL': res = left_val * right_val
+                    elif op == 'SEQ': res = 1 if left_val == right_val else 0
+                    elif op == 'SNE': res = 1 if left_val != right_val else 0
+                    elif op == 'SLT': res = 1 if left_val < right_val else 0
+                    elif op == 'SGT': res = 1 if left_val > right_val else 0
+                    else: res = None
+                    if res is not None:
+                        val_constants[parts[0]] = res
+                except ValueError:
+                    val_constants.pop(parts[0], None)
                 
         elif len(parts) == 4 and parts[0] == "ifFalse":
             r_cond, loads = get_read_op(parts[1], TEMP1)
             asm.extend(loads)
             asm.append(f"BEQ {r_cond}, $zero, {parts[3]}")
-            
+            val_constants.clear()
+
         elif len(parts) == 2 and parts[0] == "goto":
             asm.append(f"J {parts[1]}")
+            val_constants.clear()
     
     # Generate CFG mapping for Frontend Dagre-D3
     cfg = ControlFlowGraph(opt_tac)
@@ -1416,7 +1555,16 @@ def compile_code(source_code, k_regs=4):
         "entry": cfg.entry_node
     }
     
-    # Finalize Symbol Table: Inject Post-Optimization values recursively
+    # Rebuild symbol table: keep only variables that still appear
+    # as LHS assignments in the final optimized TAC.  This prunes
+    # stale entries from dead-code-eliminated or unreachable code.
+    surviving_vars = set()
+    for line in opt_tac:
+        parts = line.split(" ")
+        if len(parts) >= 3 and parts[1] == "=":
+            surviving_vars.add(parts[0])
+    
+    # Inject post-optimization values for surviving variables
     for line in opt_tac:
         parts = line.split(" ")
         if len(parts) >= 3 and parts[1] == "=":
@@ -1425,10 +1573,10 @@ def compile_code(source_code, k_regs=4):
             if dest in engine.symbol_table:
                 engine.symbol_table[dest]["value"] = val_str
                 
-    # Filter out any internal TAC temporaries that leaked into AST assignments
+    # Prune: remove temporaries and variables no longer in final TAC
     for dest in list(engine.symbol_table.keys()):
         is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
-        if is_temp:
+        if is_temp or dest not in surviving_vars:
             del engine.symbol_table[dest]
     
     errors = parse_errors + engine.semantic_errors

@@ -196,4 +196,4 @@ x = sqrt(z);
 ## Team
 
 **Team 19 — C-Section**
-Compiler Design Mini Project · 2025–2026
+Compiler Design Mini Project · 2026-2027
