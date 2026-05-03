@@ -1543,16 +1543,18 @@ class CompilerEngine:
         if frame_size > 0:
             asm.append(f"  ADDI $sp, $sp, -{frame_size}")
 
-        def get_reg(v, scratch):
-            """Returns (register_name, load_code). Uses state tracking to eliminate redundant loads."""
+        def get_reg(v, scratch, preferred_reg=None):
+            """Returns (register_name, load_code). target is preferred if provided."""
+            target = preferred_reg if preferred_reg else scratch
+            
             # Case 1: Literal Constant
             try:
                 val = float(v)
                 if val.is_integer(): val = int(val)
-                if scratch_state[scratch] == str(val):
-                    return scratch, []
-                scratch_state[scratch] = str(val)
-                return scratch, [f"  LI {scratch}, {val}"]
+                if scratch_state.get(target) == str(val):
+                    return target, []
+                scratch_state[target] = str(val)
+                return target, [f"  LI {target}, {val}"]
             except ValueError: pass
 
             # Case 2: Permanent Register Assignment
@@ -1686,7 +1688,8 @@ class CompilerEngine:
                 # Simple Assignment: x = y
                 elif len(parts) == 3:
                     src = parts[2]
-                    r_s, lds = get_reg(src, TEMP1)
+                    d_reg = reg_map.get(dest, TEMP1)
+                    r_s, lds = get_reg(src, TEMP1, preferred_reg=d_reg)
                     asm.extend(lds)
                     asm.extend(store_val(dest, r_s))
                 
