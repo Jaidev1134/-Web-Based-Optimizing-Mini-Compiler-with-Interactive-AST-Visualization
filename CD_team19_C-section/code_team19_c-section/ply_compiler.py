@@ -268,6 +268,23 @@ parser = yacc.yacc(debug=False, write_tables=False)
 # 3. ADVANCED OPTIMIZATIONS (CFG & LICM)
 # ==========================================
 
+def is_valid_var(v):
+    """Return True only for proper identifiers (variable/temp names).
+    Rejects numeric literals, string literals, operators, and keywords."""
+    if not v:
+        return False
+    # Reject numeric literals (int or float)
+    try:
+        float(v)
+        return False
+    except ValueError:
+        pass
+    # Reject string literals (quoted values)
+    if v.startswith('"') or v.startswith("'"):
+        return False
+    # Must be a valid Python identifier (covers a-z, A-Z, _, digits after first char)
+    return v.isidentifier()
+
 class BasicBlock:
     def __init__(self, bid):
         self.id = bid
@@ -341,7 +358,7 @@ class ControlFlowGraph:
         for n in nodes: self.blocks[n].dom = set(nodes)
         if self.entry_node in self.blocks:
             self.blocks[self.entry_node].dom = {self.entry_node}
-            
+
         changed = True
         while changed:
             changed = False
@@ -356,6 +373,29 @@ class ControlFlowGraph:
                 if new_dom != self.blocks[n].dom:
                     self.blocks[n].dom = new_dom
                     changed = True
+
+        # Compute immediate dominators using proper algorithm
+        # idom(n) = unique strict dominator of n that doesn't dominate any other strict dominator
+        for n in nodes:
+            if n == self.entry_node:
+                self.blocks[n].idom = None
+                continue
+            doms_of_n = self.blocks[n].dom - {n}
+            if not doms_of_n:
+                self.blocks[n].idom = None
+                continue
+            # idom is the strict dominator with no other strict dominator between it and n
+            idom_candidate = None
+            for d in doms_of_n:
+                is_idom = True
+                for other in doms_of_n:
+                    if other != d and d in self.blocks[other].dom:
+                        is_idom = False
+                        break
+                if is_idom:
+                    idom_candidate = d
+                    break
+            self.blocks[n].idom = idom_candidate
 
     def _insert_preheaders(self):
         loops = []
@@ -400,6 +440,19 @@ class ControlFlowGraph:
             ph.succs.add(header)
             self.blocks[header].preds.add(ph_id)
 
+    def build_line_map(self):
+        """Correct mapping using stable indices (no string matching)."""
+        self.line_map = {}
+        self.block_lines = {}
+
+        idx = 0
+        for b_id, bb in self.blocks.items():
+            self.block_lines[b_id] = []
+            for _ in bb.tac:
+                self.line_map[idx] = b_id
+                self.block_lines[b_id].append(idx)
+                idx += 1
+
     def flatten(self):
         visited = set()
         flattened = []
@@ -408,35 +461,104 @@ class ControlFlowGraph:
             visited.add(node_id)
             bb = self.blocks[node_id]
             if bb.tac and not bb.tac[0].endswith(":"):
-                if node_id.startswith("B") or node_id.startswith("PH_"): pass 
+                if node_id.startswith("B") or node_id.startswith("PH_"): pass
             flattened.extend(bb.tac)
-            
+
             explicit_targets = set()
             if bb.tac:
                 last_line = bb.tac[-1]
                 if last_line.startswith("goto "): explicit_targets.add(last_line.split(" ")[1])
                 elif last_line.startswith("ifFalse "): explicit_targets.add(last_line.split(" ")[-1])
-            
+
             fallthrough = None
             for succ in bb.succs:
                 if succ not in explicit_targets:
                     fallthrough = succ
                     break
-                    
+
             if fallthrough:
                 if fallthrough in visited:
                     flattened.append(f"goto {fallthrough}")
                 else:
                     visit(fallthrough)
-            for succ in bb.succs:
-                if succ != fallthrough:
-                    if succ not in visited:
-                        visit(succ)
-                    else:
-                        pass # explicit gots are already captured in bb.tac
-                    
         visit(self.entry_node)
         return flattened
+
+    def compute_liveness(self):
+        # BUG FIX: Never call flatten() inside analysis! It reorders instructions 
+        # and makes index-based maps (inst_out) invalid.
+        tac = self.tac_list
+        
+        succs = {i: set() for i in range(len(tac))}
+        labels = {}
+        for i, line in enumerate(tac):
+            if line.endswith(":"):
+                labels[line[:-1]] = i
+                
+        for i, line in enumerate(tac):
+            if line.startswith("goto "):
+                target = line.split(" ")[1]
+                if target in labels: succs[i].add(labels[target])
+            elif line.startswith("ifFalse "):
+                target = line.split(" ")[-1]
+                if target in labels: succs[i].add(labels[target])
+                if i + 1 < len(tac): succs[i].add(i + 1)
+            elif line.startswith("return "):
+                pass
+            else:
+                if i + 1 < len(tac): succs[i].add(i + 1)
+                
+        USE = {}
+        DEF = {}
+        for i, line in enumerate(tac):
+            u, d = set(), set()
+            parts = line.split(" ")
+            if len(parts) >= 3 and parts[1] == '=':
+                if is_valid_var(parts[0]):
+                    d.add(parts[0])
+                for j in range(2, len(parts)):
+                    try: float(parts[j])
+                    except ValueError:
+                        val = parts[j].replace(',', '')
+                        if val not in ('call', 'sin', 'cos', 'sqrt', '+', '-', '*', '/', '^', '==', '!=', '<', '>', '<=', '>=') and is_valid_var(val):
+                            u.add(val)
+            elif line.startswith("ifFalse "):
+                try: float(parts[1])
+                except ValueError:
+                    if is_valid_var(parts[1]):
+                        u.add(parts[1])
+            elif line.startswith("return "):
+                try: float(parts[1])
+                except ValueError:
+                    if is_valid_var(parts[1]):
+                        u.add(parts[1])
+            USE[i] = u
+            DEF[i] = d
+
+        IN = {i: set() for i in range(len(tac))}
+        OUT = {i: set() for i in range(len(tac))}
+        
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(tac)-1, -1, -1):
+                old_in = IN[i].copy()
+                old_out = OUT[i].copy()
+                
+                new_out = set()
+                for s in succs[i]:
+                    new_out.update(IN[s])
+                    
+                OUT[i] = new_out
+                
+                IN[i] = USE[i].union(OUT[i].difference(DEF[i]))
+                if IN[i] != old_in or OUT[i] != old_out:
+                    changed = True
+                    
+        self.inst_in = IN
+        self.inst_out = OUT
+        self.inst_use = USE
+        self.inst_def = DEF
 
 class LICMOptimizer:
     def __init__(self, cfg):
@@ -530,117 +652,48 @@ class LICMOptimizer:
                             
                     new_tac.append(line)
                 bb.tac = new_tac
-        return self.changed
 
 class GraphColoringAllocator:
     def __init__(self, tac_list, k=4):
         self.tac_list = tac_list
-        self.k = k
+        self.interference = {}
         self.reg_map = {}
         self.spilled = set()
-        self.interference = {}
-        self.ops = {'+', '-', '*', '/', '^', '<', '>', '<=', '>=', '==', '!=', 'call'}
+        self.k = k
 
-    @staticmethod
-    def is_valid_var(v):
-        """Return True only for proper identifiers (variable/temp names).
-        Rejects numeric literals, string literals, operators, and keywords."""
-        if not v:
-            return False
-        # Reject numeric literals (int or float)
-        try:
-            float(v)
-            return False
-        except ValueError:
-            pass
-        # Reject string literals (quoted values)
-        if v.startswith('"') or v.startswith("'"):
-            return False
-        # Must be a valid Python identifier (covers a-z, A-Z, _, digits after first char)
-        return v.isidentifier()
+        # Exclude loop iterators entirely from Graph Coloring Register Allocation
+        self.exclude_vars = set()
+        for line in tac_list:
+            if " = " in line and " + 1" in line:
+                dest = line.split(" ")[0]
+                if len(dest) == 1:
+                    self.exclude_vars.add(dest)
+
+        self.ops = {'+', '-', '*', '/', '^', '==', '!=', '<', '>', '<=', '>='}
         
     def allocate(self):
-        succs = {i: set() for i in range(len(self.tac_list))}
-        labels = {}
-        for i, line in enumerate(self.tac_list):
-            if line.endswith(":"):
-                labels[line[:-1]] = i
-                
-        for i, line in enumerate(self.tac_list):
-            if line.startswith("goto "):
-                target = line.split(" ")[1]
-                if target in labels: succs[i].add(labels[target])
-            elif line.startswith("ifFalse "):
-                target = line.split(" ")[-1]
-                if target in labels: succs[i].add(labels[target])
-                if i + 1 < len(self.tac_list): succs[i].add(i + 1)
-            elif line.startswith("return "):
-                pass
-            else:
-                if i + 1 < len(self.tac_list): succs[i].add(i + 1)
-                
-        USE = {}
-        DEF = {}
-        for i, line in enumerate(self.tac_list):
-            u, d = set(), set()
-            parts = line.split(" ")
-            if len(parts) >= 3 and parts[1] == '=':
-                if self.is_valid_var(parts[0]):
-                    d.add(parts[0])
-                for j in range(2, len(parts)):
-                    try: float(parts[j])
-                    except ValueError:
-                        val = parts[j].replace(',', '')
-                        if val not in self.ops and val not in ['call', 'sin', 'cos', 'sqrt'] and self.is_valid_var(val):
-                            u.add(val)
-            elif line.startswith("ifFalse "):
-                try: float(parts[1])
-                except ValueError:
-                    if self.is_valid_var(parts[1]):
-                        u.add(parts[1])
-            elif line.startswith("return "):
-                try: float(parts[1])
-                except ValueError:
-                    if self.is_valid_var(parts[1]):
-                        u.add(parts[1])
-            USE[i] = u
-            DEF[i] = d
-
-        IN = {i: set() for i in range(len(self.tac_list))}
-        OUT = {i: set() for i in range(len(self.tac_list))}
-        
-        changed = True
-        while changed:
-            changed = False
-            for i in range(len(self.tac_list)-1, -1, -1):
-                old_in = IN[i].copy()
-                old_out = OUT[i].copy()
-                
-                new_out = set()
-                for s in succs[i]:
-                    new_out.update(IN[s])
-                    
-                OUT[i] = new_out
-                
-                IN[i] = USE[i].union(OUT[i].difference(DEF[i]))
-                if IN[i] != old_in or OUT[i] != old_out:
-                    changed = True
+        cfg = ControlFlowGraph(self.tac_list)
+        cfg.compute_liveness()
+        self.tac_list = cfg.tac_list
+        USE = cfg.inst_use
+        DEF = cfg.inst_def
+        OUT = cfg.inst_out
 
         for u_set in USE.values():
             for v in u_set:
-                if self.is_valid_var(v):
+                if is_valid_var(v):
                     self.interference.setdefault(v, set())
         for d_set in DEF.values():
             for v in d_set:
-                if self.is_valid_var(v):
+                if is_valid_var(v):
                     self.interference.setdefault(v, set())
             
         for i in range(len(self.tac_list)):
-            for d in DEF[i]:
-                if not self.is_valid_var(d):
+            for d in DEF.get(i, set()):
+                if not is_valid_var(d):
                     continue
                 for l in OUT[i]:
-                    if d != l and self.is_valid_var(l):
+                    if d != l and is_valid_var(l):
                         self.interference[d].add(l)
                         self.interference.setdefault(l, set()).add(d)
 
@@ -866,7 +919,12 @@ class CompilerEngine:
         for i, line in enumerate(tac):
             if line.startswith("goto "):
                 target = line.split(" ")[1] + ":"
+                # Remove goto if next line IS the target (fallthrough)
                 if i + 1 < len(tac) and tac[i+1] == target:
+                    changed = True
+                    continue
+                # Remove goto at the very end of TAC (dangling jump)
+                if i == len(tac) - 1:
                     changed = True
                     continue
             clean_tac.append(line)
@@ -884,7 +942,8 @@ class CompilerEngine:
                 parts2 = next_line.split(" ")
                 if len(parts1) >= 3 and parts1[1] == '=' and len(parts2) == 3 and parts2[1] == '=':
                     dest1 = parts1[0]
-                    if len(dest1) > 1 and dest1[0] == 't' and dest1[1:].isdigit():
+                    is_temp1 = (len(dest1) > 1 and dest1[0] == 't' and dest1[1:].isdigit()) or dest1.startswith("t_hoist_")
+                    if is_temp1:
                         dest2 = parts2[0]
                         src2 = parts2[2]
                         if src2 == dest1:
@@ -896,132 +955,6 @@ class CompilerEngine:
             inline_tac.append(line)
             i += 1
         return changed, inline_tac
-
-    def _pass_forward_optimizations(self, tac):
-        new_tac = []
-        changed = False
-        constants = {}
-        aliases = {}
-        reads = set()
-        
-        active_labels = set()
-        for line in tac:
-            if line.startswith("goto "):
-                active_labels.add(line.split(" ")[1])
-            elif line.startswith("ifFalse "):
-                active_labels.add(line.split(" ")[3])
-
-        for line in tac:
-            parts = line.split(" ")
-            is_label = line.endswith(":")
-            is_jump = line.startswith("goto") or line.startswith("ifFalse")
-            
-            if is_label:
-                label_name = line[:-1]
-                if label_name in active_labels:
-                    constants.clear()
-                    aliases.clear()
-            
-            skip_propagation = False
-            start_idx = 2 if (len(parts) >= 2 and parts[1] == '=') else 0
-            if not skip_propagation:
-                for i in range(start_idx, len(parts)):
-                    if parts[i] in constants:
-                        parts[i] = str(constants[parts[i]])
-                    elif parts[i] in aliases:
-                        parts[i] = str(aliases[parts[i]])
-            
-            line_rebuilt = " ".join(parts)
-            assigned_var = parts[0] if (len(parts) > 1 and parts[1] == '=') else None
-            
-            if assigned_var:
-                aliases = {k: v for k, v in aliases.items() if v != assigned_var}
-            
-            if len(parts) == 3 and parts[1] == '=':
-                try:
-                    val = float(parts[2])
-                    if val.is_integer(): val = int(val)
-                    constants[parts[0]] = val
-                    new_tac.append(line_rebuilt)
-                except ValueError:
-                    aliases[parts[0]] = parts[2]
-                    new_tac.append(line_rebuilt)
-                    reads.add(parts[2])
-                    
-            elif len(parts) == 5 and parts[1] == '=':
-                try: left = float(parts[2]); is_left_const = True
-                except ValueError: is_left_const = False
-                try: right = float(parts[4]); is_right_const = True
-                except ValueError: is_right_const = False
-                op = parts[3]
-                
-                # Constant Folding — but NEVER fold division; keep it symbolic
-                # so that runtime divide-by-zero is not masked.
-                if is_left_const and is_right_const and op != '/':
-                    res = None
-                    left = float(parts[2]); right = float(parts[4])
-                    if op == '+': res = left + right
-                    elif op == '-': res = left - right
-                    elif op == '*': res = left * right
-                    elif op == '==': res = 1 if left == right else 0
-                    elif op == '!=': res = 1 if left != right else 0
-                    elif op == '<':  res = 1 if left < right else 0
-                    elif op == '>':  res = 1 if left > right else 0
-                    elif op == '<=': res = 1 if left <= right else 0
-                    elif op == '>=': res = 1 if left >= right else 0
-                    
-                    if res is not None:
-                        if isinstance(res, float) and res.is_integer(): res = int(res)
-                        constants[parts[0]] = res
-                        new_tac.append(f"{parts[0]} = {res}")
-                        changed = True
-                        continue
-                        
-                # Algebraic Simplifications
-                if is_right_const and float(parts[4]) == 0 and op in ('+', '-'):
-                    new_tac.append(f"{parts[0]} = {parts[2]}")
-                    changed = True; reads.add(parts[2])
-                    continue
-                if is_right_const and float(parts[4]) == 1 and op in ('*', '/'):
-                    new_tac.append(f"{parts[0]} = {parts[2]}")
-                    changed = True; reads.add(parts[2])
-                    continue
-                if is_right_const and float(parts[4]) == 0 and op == '*':
-                    new_tac.append(f"{parts[0]} = 0")
-                    constants[parts[0]] = 0; changed = True
-                    continue
-                if is_left_const and float(parts[2]) == 0 and op == '+':
-                    new_tac.append(f"{parts[0]} = {parts[4]}")
-                    changed = True; reads.add(parts[4])
-                    continue
-                if is_left_const and float(parts[2]) == 1 and op == '*':
-                    new_tac.append(f"{parts[0]} = {parts[4]}")
-                    changed = True; reads.add(parts[4])
-                    continue
-
-                if not is_left_const: reads.add(parts[2])
-                if not is_right_const: reads.add(parts[4])
-                new_tac.append(line_rebuilt)
-            elif len(parts) == 4 and parts[0] == 'ifFalse':
-                try:
-                    c_val = float(parts[1])
-                    if c_val == 0:
-                        new_tac.append(f"goto {parts[3]}")
-                        changed = True
-                    else:
-                        changed = True  # Branch elimination
-                except ValueError:
-                    new_tac.append(line_rebuilt)
-                    reads.add(parts[1])
-            else:
-                new_tac.append(line_rebuilt)
-                if len(parts) >= 3 and parts[1] == '=' and parts[2] == 'call':
-                    reads.add(parts[4])
-
-            if is_jump:
-                constants.clear(); aliases.clear()
-                
-        return changed, new_tac
 
     def _pass_unreachable_code(self, tac):
         changed = False
@@ -1050,50 +983,100 @@ class CompilerEngine:
                 
         return changed, reachable_tac
 
-    def _pass_dead_store_elimination(self, tac):
+    def _pass_dead_store_elimination(self, tac, inst_out):
+        """Remove assignments to temporaries whose LHS is not live afterward.
+        Preserved user variables while optimizing away dead intermediate temporaries.
+        """
         changed = False
         final_tac = []
-        needed = set()
-        user_vars = set()
         
+        # --- Correctness Fix: Protect all variables used in control flow or as arguments ---
+        # Even if liveness analysis (due to index shifts or edge cases) thinks they are dead,
+        # if they are used as a source in critical ops, we MUST preserve their definition.
+        protected_vars = set()
         for line in tac:
-            parts = line.split(" ")
-            if len(parts) >= 3 and parts[1] == '=':
-                dest = parts[0]
-                is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
-                if not is_temp: user_vars.add(dest)
-        
-        needed.update(user_vars)
+            parts = line.split()
+            if not parts: continue
+            # 1. Branch/Return conditions
+            if parts[0] in ("ifFalse", "if") and len(parts) > 1:
+                protected_vars.add(parts[1])
+            elif parts[0] == "return" and len(parts) > 1:
+                if is_valid_var(parts[1]): protected_vars.add(parts[1])
+            # 2. Call arguments: t = call f, arg
+            elif 'call' in parts and len(parts) >= 5:
+                arg = parts[4].replace(',', '')
+                if is_valid_var(arg): protected_vars.add(arg)
 
-        for line in reversed(tac):
-            parts = line.split(" ")
-            is_label = line.endswith(":")
-            is_jump = line.startswith("goto") or line.startswith("ifFalse")
-            
-            if is_label or is_jump:
-                needed.update(user_vars)
+        # --- Safety Shield: Helper to scan for downstream uses ---
+        def has_downstream_use(var, start_idx):
+            for j in range(start_idx + 1, len(tac)):
+                l = tac[j]
+                if l.endswith(":"): continue
+                lp = l.split()
+                if var in lp[1:]: return True
+                if len(lp) >= 2 and lp[1] == '=' and lp[0] == var: return False
+            return False
+
+        for i, line in enumerate(tac):
+            if line.endswith(":"):
+                final_tac.append(line)
+                continue
                 
+            parts = line.split(" ")
             if len(parts) >= 3 and parts[1] == '=':
                 dest = parts[0]
-                if dest not in needed:
-                    changed = True
-                    continue
-                
-                needed.remove(dest)
-                for i in range(2, len(parts)):
-                    val = parts[i]
-                    try: float(val)
-                    except ValueError:
-                        if val not in ('call', 'goto', 'ifFalse'):
-                            needed.add(val)
-            elif line.startswith("ifFalse "):
-                needed.add(parts[1])
-            elif line.startswith("return "):
-                needed.add(parts[1])
-                
-            final_tac.insert(0, line)
-            
+                is_call = 'call' in parts
+                if is_valid_var(dest):
+                    # Protection 1: Never remove variables used in upcoming control flow or calls
+                    if dest in protected_vars:
+                        final_tac.append(line)
+                        continue
+                        
+                    # Protection 2: Standard liveness-based elimination for temporaries
+                    is_temp = len(dest) > 1 and dest[0] == 't' and (dest[1:].isdigit() or dest.startswith("t_hoist_"))
+                    if is_temp and not is_call:
+                        # Check OUT set
+                        is_live = dest in inst_out.get(i, set())
+                        # If not live in OUT, do the Safety Shield Scan
+                        if not is_live:
+                            if has_downstream_use(dest, i):
+                                final_tac.append(line)
+                                continue
+                            else:
+                                changed = True
+                                continue
+            final_tac.append(line)
+
         return changed, final_tac
+
+    def _validate_tac_integrity(self, tac):
+        """Non-crashing validation to catch 'use-before-def' bugs in the optimizer."""
+        defined = set()
+        warnings = []
+        for i, line in enumerate(tac):
+            if line.endswith(":"): continue
+            parts = line.split()
+            if not parts: continue
+            
+            # 1. Identify uses (skip LHS of assignment)
+            start_idx = 2 if (len(parts) >= 2 and parts[1] == '=') else 0
+            for j in range(start_idx, len(parts)):
+                p = parts[j].replace(',', '')
+                if is_valid_var(p) and p not in defined:
+                    # Ignore constants and reserved words
+                    if not (p.replace('-','').isdigit() or p in ('call', 'goto', 'ifFalse', 'if', 'return')):
+                        warnings.append(f"Line {i}: Variable '{p}' used without prior definition in TAC: '{line}'")
+            
+            # 2. Record definitions
+            if len(parts) >= 2 and parts[1] == '=':
+                defined.add(parts[0])
+        
+        if warnings:
+            print("\n[TAC OPTIMIZER WARNINGS]")
+            for w in warnings[:10]: # Don't flood the console
+                print(f"  ! {w}")
+            if len(warnings) > 10: print(f"  ... and {len(warnings)-10} more")
+        return warnings
         
     def _pass_strength_reduction(self, tac):
         changed = False
@@ -1130,71 +1113,6 @@ class CompilerEngine:
             new_tac.append(line)
         return changed, new_tac
 
-    def _pass_local_cse(self, tac):
-        changed = False
-        new_tac = []
-        available_expr = {} # key: canonical_expr, value: temporary/dest
-        
-        for line in tac:
-            parts = line.split(" ")
-            
-            # Reset only at basic block entry points (labels).
-            # Jumps end a block but expressions computed before the jump
-            # are still valid for instructions between the last label and
-            # the jump, so we keep the table alive through them.
-            if line.endswith(":"):
-                available_expr.clear()
-                new_tac.append(line)
-                continue
-            
-            if line.startswith("goto") or line.startswith("ifFalse"):
-                new_tac.append(line)
-                continue
-                
-            if len(parts) == 5 and parts[1] == '=':
-                dest, left, op, right = parts[0], parts[2], parts[3], parts[4]
-                
-                # Canonicalization: a + b == b + a, a * b == b * a
-                if op in ('+', '*', '==', '!='):
-                    c_left, c_right = min(left, right), max(left, right)
-                else:
-                    c_left, c_right = left, right
-                    
-                expr_key = f"{c_left} {op} {c_right}"
-                
-                if expr_key in available_expr:
-                    # CSE Match!
-                    new_tac.append(f"{dest} = {available_expr[expr_key]}")
-                    changed = True
-                else:
-                    available_expr[expr_key] = dest
-                    new_tac.append(line)
-                    
-            elif len(parts) == 3 and parts[1] == '=':
-                dest = parts[0]
-                # Invalidation: if a user variable is assigned, clear related expressions
-                # Temporaries (tN) are SSA, so they never invalidate themselves
-                is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
-                if not is_temp:
-                    # Invalidate any expression containing `dest`
-                    to_remove = [k for k in available_expr if dest in k.split(" ")]
-                    for k in to_remove:
-                        del available_expr[k]
-                new_tac.append(line)
-            else:
-                new_tac.append(line)
-                
-            # If line assignment involves a 5-part op, we also need to invalidate
-            # if `dest` isn't a temp
-            if len(parts) == 5 and parts[1] == '=':
-                dest = parts[0]
-                is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
-                if not is_temp:
-                    to_remove = [k for k in available_expr if dest in k.split(" ")]
-                    for k in to_remove:
-                        del available_expr[k]
-                        
-        return changed, new_tac
     def _pass_unused_labels(self, tac):
         active_labels = set()
         for line in tac:
@@ -1212,155 +1130,587 @@ class CompilerEngine:
             clean_tac.append(line)
         return changed, clean_tac
 
+
+
+    def _pass_constant_propagation(self, tac, cfg):
+        """Dataflow-based constant propagation. Only replaces variables with known constants.
+        Does NOT fold expressions — that belongs in _pass_constant_folding."""
+        changed_overall = False
+        IN_const = {b_id: {} for b_id in cfg.blocks}
+        OUT_const = {b_id: {} for b_id in cfg.blocks}
+
+        # TOP: variable may be constant
+        # BOT: conflicting values, kill the constant
+        # We use {} as TOP (no info), specific value as const, key deleted as BOT
+
+        df_changed = True
+        while df_changed:
+            df_changed = False
+            for b_id, bb in cfg.blocks.items():
+                old_out = OUT_const[b_id].copy()
+
+                if bb.preds:
+                    first_pred = True
+                    for p in bb.preds:
+                        if first_pred:
+                            IN_const[b_id] = OUT_const[p].copy()
+                            first_pred = False
+                        else:
+                            keys = list(IN_const[b_id].keys())
+                            for k in keys:
+                                if k not in OUT_const[p] or OUT_const[p][k] != IN_const[b_id][k]:
+                                    del IN_const[b_id][k]  # BOT - conflicting constants
+
+                curr_consts = IN_const[b_id].copy()
+                aliases = {}
+
+                new_tac = []
+                block_changed = False
+
+                for line in bb.tac:
+                    parts = line.split(" ")
+                    if line.endswith(":"):
+                        new_tac.append(line)
+                        continue
+
+                    start_idx = 2 if (len(parts) >= 2 and parts[1] == '=') else 0
+                    for i in range(start_idx, len(parts)):
+                        if parts[i] in curr_consts:
+                            parts[i] = str(curr_consts[parts[i]])
+                            block_changed = True
+                        elif parts[i] in aliases:
+                            parts[i] = str(aliases[parts[i]])
+                            block_changed = True
+
+                    line_rebuilt = " ".join(parts)
+                    assigned_var = parts[0] if (len(parts) > 1 and parts[1] == '=') else None
+
+                    if assigned_var:
+                        aliases = {k: v for k, v in aliases.items() if v != assigned_var}
+                        if assigned_var in curr_consts:
+                            del curr_consts[assigned_var]
+
+                    # Pure propagation: simple copy or alias only
+                    if len(parts) == 3 and parts[1] == '=':
+                        try:
+                            val = float(parts[2])
+                            if val.is_integer(): val = int(val)
+                            curr_consts[parts[0]] = val
+                        except ValueError:
+                            # Only alias to non-temporary variables
+                            # (temporaries can be eliminated by DSE, creating dangling refs)
+                            src = parts[2]
+                            is_temp_src = (len(src) > 1 and src[0] == 't' and src[1:].isdigit()) or src.startswith("t_hoist_")
+                            if not is_temp_src:
+                                aliases[parts[0]] = src
+
+                    # NO folding of binary expressions here.
+                    # Only propagate through simple copies.
+
+                    new_tac.append(line_rebuilt)
+
+                OUT_const[b_id] = curr_consts
+                if OUT_const[b_id] != old_out:
+                    df_changed = True
+
+                if block_changed:
+                    bb.tac = new_tac
+                    changed_overall = True
+
+        # Reconstruct TAC from blocks preserving original order (not DFS)
+        result_tac = []
+        for b_id in cfg.blocks:
+            result_tac.extend(cfg.blocks[b_id].tac)
+        return changed_overall, result_tac
+
+    def _pass_constant_folding(self, tac):
+        changed = False
+        new_tac = []
+        for line in tac:
+            parts = line.split(" ")
+            if len(parts) == 5 and parts[1] == '=':
+                try: left = float(parts[2]); is_left_const = True
+                except ValueError: is_left_const = False
+                try: right = float(parts[4]); is_right_const = True
+                except ValueError: is_right_const = False
+                op = parts[3]
+                
+                if is_left_const and is_right_const:
+                    left_val = float(parts[2])
+                    right_val = float(parts[4])
+                    res = None
+                    if op == '/':
+                        if right_val == 0:
+                            if not hasattr(self, 'semantic_errors'): self.semantic_errors = []
+                            msg = "Division by zero detected at compile time"
+                            if msg not in self.semantic_errors:
+                                self.semantic_errors.append(msg)
+                        else:
+                            res = left_val / right_val
+                    else:
+                        if op == '+': res = left_val + right_val
+                        elif op == '-': res = left_val - right_val
+                        elif op == '*': res = left_val * right_val
+                        elif op == '==': res = 1 if left_val == right_val else 0
+                        elif op == '!=': res = 1 if left_val != right_val else 0
+                        elif op == '<':  res = 1 if left_val < right_val else 0
+                        elif op == '>':  res = 1 if left_val > right_val else 0
+                        elif op == '<=': res = 1 if left_val <= right_val else 0
+                        elif op == '>=': res = 1 if left_val >= right_val else 0
+                    
+                    if res is not None:
+                        if isinstance(res, float) and res.is_integer(): res = int(res)
+                        new_tac.append(f"{parts[0]} = {res}")
+                        changed = True
+                        continue
+            elif len(parts) == 4 and parts[0] == 'ifFalse':
+                try:
+                    c_val = float(parts[1])
+                    if c_val == 0:
+                        new_tac.append(f"goto {parts[3]}")
+                        changed = True; continue
+                    else:
+                        changed = True; continue 
+                except ValueError:
+                    pass
+                    
+            new_tac.append(line)
+        return changed, new_tac
+
+    def _pass_global_cse(self, tac, cfg):
+        changed_overall = False
+        dom_tree = {n: [] for n in cfg.blocks}
+        for n in cfg.blocks:
+            idom = None
+            for d in cfg.blocks[n].dom:
+                if d != n:
+                    is_idom = True
+                    for other in cfg.blocks[n].dom:
+                        if other != n and other != d and d in cfg.blocks[other].dom:
+                            is_idom = False
+                            break
+                    if is_idom: idom = d
+            if idom:
+                dom_tree[idom].append(n)
+                
+        def traverse(n, avail_exprs):
+            nonlocal changed_overall
+            bb = cfg.blocks[n]
+            new_tac = []
+            block_changed = False
+            
+            curr_exprs = avail_exprs.copy()
+            
+            for line in bb.tac:
+                parts = line.split(" ")
+                
+                if line.endswith(":") or line.startswith("goto") or line.startswith("ifFalse"):
+                    new_tac.append(line)
+                    continue
+                    
+                if len(parts) == 5 and parts[1] == '=':
+                    dest, left, op, right = parts[0], parts[2], parts[3], parts[4]
+                    if op in ('+', '*', '==', '!='):
+                        c_left, c_right = min(left, right), max(left, right)
+                    else:
+                        c_left, c_right = left, right
+                        
+                    expr_key = f"{c_left} {op} {c_right}"
+                    
+                    if expr_key in curr_exprs:
+                        new_line = f"{dest} = {curr_exprs[expr_key]}"
+                        new_tac.append(new_line)
+                        block_changed = True
+                    else:
+                        curr_exprs[expr_key] = dest
+                        new_tac.append(line)
+                        
+                    is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
+                    if not is_temp:
+                        to_remove = [k for k in curr_exprs if dest in k.split(" ")]
+                        for k in to_remove:
+                            del curr_exprs[k]
+                        to_remove_val = [k for k, v in curr_exprs.items() if v == dest and k != expr_key]
+                        for k in to_remove_val:
+                            del curr_exprs[k]
+
+                elif len(parts) >= 3 and parts[1] == '=':
+                    dest = parts[0]
+                    new_tac.append(line)
+                    
+                    is_temp = len(dest) > 1 and dest[0] == 't' and dest[1:].isdigit()
+                    if not is_temp:
+                        to_remove = [k for k in curr_exprs if dest in k.split(" ")]
+                        for k in to_remove:
+                            del curr_exprs[k]
+                        to_remove_val = [k for k, v in curr_exprs.items() if v == dest]
+                        for k in to_remove_val:
+                            del curr_exprs[k]
+                else:
+                    new_tac.append(line)
+                    
+            if block_changed:
+                bb.tac = new_tac
+                changed_overall = True
+                
+            for child in dom_tree[n]:
+                traverse(child, curr_exprs)
+                
+        traverse(cfg.entry_node, {})
+        # Reconstruct TAC from blocks preserving original order (not DFS)
+        result_tac = []
+        for b_id in cfg.blocks:
+            result_tac.extend(cfg.blocks[b_id].tac)
+        return changed_overall, result_tac
+
     def optimize_tac(self):
         opt_tac = self.tac[:]
         changed = True
-        
-        while changed:
+        iteration = 0
+        MAX_ITER = 50
+
+        while changed and iteration < MAX_ITER:
+            iteration += 1
             changed = False
-            
-            c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
+
+            cfg = ControlFlowGraph(opt_tac)
+            cfg.compute_liveness()
+            cfg.build_line_map()
+
+            # --- CSE first (before propagation) so symbolic reuse is preserved ---
+            c, opt_tac = self._pass_global_cse(opt_tac, cfg)
             changed = changed or c
-            
-            c, opt_tac = self._pass_temporary_inlining(opt_tac)
+
+            # --- Constant Propagation ---
+            if changed:
+                cfg = ControlFlowGraph(opt_tac)
+                cfg.compute_liveness()
+                cfg.build_line_map()
+            c, opt_tac = self._pass_constant_propagation(opt_tac, cfg)
             changed = changed or c
-            
+
+            # --- Constant Folding ---
+            c, opt_tac = self._pass_constant_folding(opt_tac)
+            changed = changed or c
+
+            # --- Strength Reduction ---
             c, opt_tac = self._pass_strength_reduction(opt_tac)
             changed = changed or c
-            
-            c, opt_tac = self._pass_forward_optimizations(opt_tac)
-            changed = changed or c
-            
-            c, opt_tac = self._pass_local_cse(opt_tac)
-            changed = changed or c
-            
+
+            # --- Unreachable Code (in main loop so dead branches are cleaned
+            #     before next propagation round — enables q/r/s/t folding) ---
             c, opt_tac = self._pass_unreachable_code(opt_tac)
             changed = changed or c
-            
-            c, opt_tac = self._pass_dead_store_elimination(opt_tac)
+
+            # --- Dead Store Elimination (temporaries only) ---
+            if changed:
+                cfg = ControlFlowGraph(opt_tac)
+                cfg.compute_liveness()
+                cfg.build_line_map()
+            c, opt_tac = self._pass_dead_store_elimination(opt_tac, cfg.inst_out)
             changed = changed or c
 
-        c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
-        c, opt_tac = self._pass_unused_labels(opt_tac)
+            # --- LICM ---
+            cfg = ControlFlowGraph(opt_tac)
+            cfg.build_line_map()
+            licm = LICMOptimizer(cfg)
+            c_licm = licm.optimize()
+            if c_licm:
+                opt_tac = cfg.flatten()
+                changed = True
 
-        # Build CFG and perform advanced optimizations (LICM)
-        cfg = ControlFlowGraph(opt_tac)
-        licm = LICMOptimizer(cfg)
-        licm_changed = licm.optimize()
-        
-        if licm_changed:
-            opt_tac = cfg.flatten()
-            # Run forward optimizations to convergence so that hoisted
-            # constant expressions (e.g. a=2, b=3, q=a+b -> q=5) are fully
-            # folded after CFG flattening
-            post_changed = True
-            while post_changed:
-                post_changed = False
-                c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_temporary_inlining(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_strength_reduction(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_forward_optimizations(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_local_cse(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_unreachable_code(opt_tac)
-                post_changed = post_changed or c
-                c, opt_tac = self._pass_dead_store_elimination(opt_tac)
-                post_changed = post_changed or c
+        # === Cleanup Phase ===
+        cleanup_changed = True
+        cleanup_iteration = 0
+        while cleanup_changed and cleanup_iteration < MAX_ITER:
+            cleanup_iteration += 1
+            cleanup_changed = False
             c, opt_tac = self._pass_remove_useless_jumps(opt_tac)
-            c, opt_tac = self._pass_unused_labels(opt_tac)
+            cleanup_changed = cleanup_changed or c
 
+            c, opt_tac = self._pass_temporary_inlining(opt_tac)
+            cleanup_changed = cleanup_changed or c
+
+            c, opt_tac = self._pass_unreachable_code(opt_tac)
+            if c:
+                cleanup_changed = True
+                continue
+
+            c, opt_tac = self._pass_unused_labels(opt_tac)
+            cleanup_changed = cleanup_changed or c
+
+        # Final Integrity Check
+        self._validate_tac_integrity(opt_tac)
         return opt_tac
 
-    def generate_assembly(self, optimized_tac):
-        asm = []
-        allocator = GraphColoringAllocator(optimized_tac, k=4)
+    def _peephole_optimize_asm(self, asm):
+        """Pass over generated assembly to remove redundant/dead instructions."""
+        optimized_asm = []
+        i = 0
+        while i < len(asm):
+            line = asm[i]
+            stripped = line.strip()
+            indent = line[:len(line) - len(stripped)]
+            
+            # 1. Remove redundant MOVE $rx, $rx
+            if stripped.startswith("MOVE "):
+                parts = stripped.replace(',', '').split()
+                if len(parts) == 3 and parts[1] == parts[2]:
+                    i += 1
+                    continue
+            
+            # 2. Collapse LI overwrite chains: LI $r0, 10 \n LI $r0, 20 -> LI $r0, 20
+            if stripped.startswith("LI ") and i + 1 < len(asm):
+                next_stripped = asm[i+1].strip()
+                if next_stripped.startswith("LI "):
+                    p1 = stripped.replace(',', '').split()
+                    p2 = next_stripped.replace(',', '').split()
+                    if p1[1] == p2[1]: # Same register overwritten immediately
+                        i += 1
+                        continue
+
+            # 3. Remove redundant LOAD-MOVE: LI $t0, 5 \n MOVE $t1, $t0 -> LI $t1, 5
+            if stripped.startswith("LI ") and i + 1 < len(asm):
+                next_stripped = asm[i+1].strip()
+                if next_stripped.startswith("MOVE "):
+                    p1 = stripped.replace(',', '').split()
+                    p2 = next_stripped.replace(',', '').split()
+                    if p1[1] == p2[2]:
+                        optimized_asm.append(f"{indent}LI {p2[1]}, {p1[2]}")
+                        i += 2
+                        continue
+
+            # 4. Remove redundant SW+LW (store then immediate reload from same slot)
+            if stripped.startswith("SW ") and i + 1 < len(asm):
+                next_stripped = asm[i+1].strip()
+                if next_stripped.startswith("LW "):
+                    p_sw = stripped.replace(',', '').split()
+                    p_lw = next_stripped.replace(',', '').split()
+                    if len(p_sw) == 3 and len(p_lw) == 3 and p_sw[1] == p_lw[1] and p_sw[2] == p_lw[2]:
+                        i += 2
+                        continue
+                        
+            # 5. Remove J to next label (unconditional jump to immediate successor)
+            if stripped.startswith("J ") and not stripped.startswith("JAL") and i + 1 < len(asm):
+                target = stripped.split(" ")[-1]
+                if asm[i+1].strip() == f"{target}:":
+                    i += 1
+                    continue
+
+            optimized_asm.append(line)
+            i += 1
+            
+        return optimized_asm
+
+    def generate_assembly(self, optimized_tac, k_regs=4):
+        """Generates correct, efficient MIPS assembly using graph-coloring results."""
+        allocator = GraphColoringAllocator(optimized_tac, k=k_regs)
         reg_map = allocator.allocate()
         
-        asm.append("// --- Register Allocation ---")
+        # Scratch registers (not in $s pool)
+        TEMP1 = "$t7"
+        TEMP2 = "$t6"
+        
+        # Track scratch register contents to avoid redundant loads within a block
+        scratch_state = {TEMP1: None, TEMP2: None}
+
+        # Calculate spill slots ONLY for variables the allocator decided to spill
+        spill_offset = {}
+        next_slot = 0
+        for v in sorted(allocator.spilled):
+            spill_offset[v] = next_slot
+            next_slot += 4
+            
+        frame_size = next_slot
+        asm = []
+
+        # Allocation Summary (Liveness-aware)
+        asm.append("// --- Register Mapping (Liveness-aware) ---")
+        rev_map = {}
         for v, r in reg_map.items():
-            asm.append(f"// {v} -> {r}")
-        if allocator.spilled:
-            asm.append(f"// Spilled: {', '.join(allocator.spilled)}")
+            rev_map.setdefault(r, []).append(v)
+        for r in sorted(rev_map.keys()):
+            vars_list = ", ".join(sorted(rev_map[r]))
+            asm.append(f"// {r}: {vars_list}")
+        for v in sorted(spill_offset.keys()):
+            asm.append(f"// {v}: stack[{spill_offset[v]}($sp)]")
         asm.append("// ---------------------------")
-        
-        # Temp registers for spilled/constants
-        TEMP1 = "R8"
-        TEMP2 = "R9"
-        TEMP3 = "R10"
-        
-        def get_read_op(v, t_reg):
+
+        asm.append(".text")
+        asm.append(".globl main")
+        asm.append("main:")
+
+        if frame_size > 0:
+            asm.append(f"  ADDI $sp, $sp, -{frame_size}")
+
+        def get_reg(v, scratch):
+            """Returns (register_name, load_code). Uses state tracking to eliminate redundant loads."""
+            # Case 1: Literal Constant
             try:
-                float(v)
-                return t_reg, [f"LI {t_reg}, {v}"]  # Load Immediate
-            except ValueError:
-                if v in reg_map:
-                    return reg_map[v], []
-                else: # Spill Load
-                    return t_reg, [f"LW {t_reg}, {v}"]
-                    
-        def get_write_op(v, s_reg):
+                val = float(v)
+                if val.is_integer(): val = int(val)
+                if scratch_state[scratch] == str(val):
+                    return scratch, []
+                scratch_state[scratch] = str(val)
+                return scratch, [f"  LI {scratch}, {val}"]
+            except ValueError: pass
+
+            # Case 2: Permanent Register Assignment
             if v in reg_map:
-                if reg_map[v] != s_reg:
-                    return [f"MOVE {reg_map[v]}, {s_reg}"]
+                return reg_map[v], []
+
+            # Case 3: Spilled Variable
+            if v in spill_offset:
+                off = spill_offset[v]
+                if scratch_state[scratch] == f"mem_{off}":
+                    return scratch, []
+                scratch_state[scratch] = f"mem_{off}"
+                return scratch, [f"  LW {scratch}, {off}($sp)"]
+
+            # Case 4: Ephemeral/Unallocated (e.g. dead or short-lived temp)
+            # Correctness fix: We no longer inject a default 'LI 0' as it masks semantic bugs.
+            # If the allocator missed a variable, it should be obvious in the assembly.
+            scratch_state[scratch] = None
+            return scratch, [f"// WARNING: {v} used but not allocated (check DSE)"]
+
+        def store_val(dest, src_reg):
+            """Writes a value from a register into the target variable's home."""
+            if dest in reg_map:
+                if reg_map[dest] != src_reg:
+                    return [f"  MOVE {reg_map[dest]}, {src_reg}"]
                 return []
-            else:
-                return [f"SW {s_reg}, {v}"] # Spill Store
+            if dest in spill_offset:
+                off = spill_offset[dest]
+                # Invalidate scratch if we overwrite its underlying memory
+                for k in scratch_state:
+                    if scratch_state[k] == f"mem_{off}": scratch_state[k] = None
+                return [f"  SW {src_reg}, {off}($sp)"]
+            return []
 
         for line in optimized_tac:
-            line_clean = line.split("  //")[0].strip()
-            parts = line_clean.split(" ")
+            line_clean = line.split("//")[0].strip()
+            if not line_clean: continue
             
+            # Invalidate state on labels and control flow to prevent stale values
+            # propagating across basic block boundaries.
+            if line_clean.endswith(":") or line_clean.startswith("goto") or line_clean.startswith("ifFalse"):
+                scratch_state[TEMP1] = None
+                scratch_state[TEMP2] = None
+
             if line_clean.endswith(":"):
                 asm.append(line_clean)
+                continue
+
+            parts = line_clean.split(" ")
             
-            elif len(parts) == 3 and parts[1] == "=":
-                # x = y
-                src, loads = get_read_op(parts[2], TEMP1)
+            if parts[0] == "goto":
+                asm.append(f"  J {parts[1]}")
+                continue
+
+            if parts[0] == "ifFalse":
+                r_cond, loads = get_reg(parts[1], TEMP1)
                 asm.extend(loads)
+                asm.append(f"  BEQ {r_cond}, $zero, {parts[3]}")
+                continue
+
+            if len(parts) >= 3 and parts[1] == "=":
+                dest = parts[0]
                 
-                stores = get_write_op(parts[0], src)
-                asm.extend(stores)
+                # Binary Operation: x = y op z
+                if len(parts) == 5:
+                    left, op, right = parts[2], parts[3], parts[4]
+                    is_num = lambda x: x.replace('-','',1).replace('.','',1).isdigit()
+                    
+                    # ADDI optimization
+                    if op == '+' and is_num(right):
+                        r_l, lds = get_reg(left, TEMP1)
+                        asm.extend(lds)
+                        d_reg = reg_map.get(dest, TEMP1)
+                        asm.append(f"  ADDI {d_reg}, {r_l}, {right}")
+                        asm.extend(store_val(dest, d_reg))
+                    elif op == '-' and is_num(right):
+                        r_l, lds = get_reg(left, TEMP1)
+                        asm.extend(lds)
+                        d_reg = reg_map.get(dest, TEMP1)
+                        val = int(float(right))
+                        asm.append(f"  ADDI {d_reg}, {r_l}, {-val}")
+                        asm.extend(store_val(dest, d_reg))
+                    elif op == '/':
+                        r_l, lds1 = get_reg(left, TEMP1)
+                        r_r, lds2 = get_reg(right, TEMP2)
+                        asm.extend(lds1)
+                        asm.extend(lds2)
+                        # Runtime safety check for div-by-zero
+                        asm.append(f"  BEQ {r_r}, $zero, div_error")
+                        asm.append(f"  DIV {r_l}, {r_r}")
+                        d_reg = reg_map.get(dest, TEMP1)
+                        asm.append(f"  MFLO {d_reg}")
+                        asm.extend(store_val(dest, d_reg))
+                    elif op in ('<', '>', '==', '!=', '<=', '>='):
+                        r_l, lds1 = get_reg(left, TEMP1)
+                        r_r, lds2 = get_reg(right, TEMP2)
+                        asm.extend(lds1)
+                        asm.extend(lds2)
+                        d_reg = reg_map.get(dest, TEMP1)
+                        
+                        if op == '<':
+                            asm.append(f"  SLT {d_reg}, {r_l}, {r_r}")
+                        elif op == '>':
+                            asm.append(f"  SLT {d_reg}, {r_r}, {r_l}")
+                        elif op == '<=':
+                            # !(left > right)
+                            asm.append(f"  SLT {d_reg}, {r_r}, {r_l}")
+                            asm.append(f"  XORI {d_reg}, {d_reg}, 1")
+                        elif op == '>=':
+                            # !(left < right)
+                            asm.append(f"  SLT {d_reg}, {r_l}, {r_r}")
+                            asm.append(f"  XORI {d_reg}, {d_reg}, 1")
+                        elif op == '==':
+                             asm.append(f"  SUB {d_reg}, {r_l}, {r_r}")
+                             asm.append(f"  SLTIU {d_reg}, {d_reg}, 1")
+                        elif op == '!=':
+                             asm.append(f"  SUB {d_reg}, {r_l}, {r_r}")
+                             asm.append(f"  SLTU {d_reg}, $zero, {d_reg}")
+                        
+                        asm.extend(store_val(dest, d_reg))
+                    else:
+                        m_op = {'+':'ADD', '-':'SUB', '*':'MUL'}.get(op, 'ADD')
+                        r_l, lds1 = get_reg(left, TEMP1)
+                        r_r, lds2 = get_reg(right, TEMP2)
+                        asm.extend(lds1)
+                        asm.extend(lds2)
+                        d_reg = reg_map.get(dest, TEMP1)
+                        asm.append(f"  {m_op} {d_reg}, {r_l}, {r_r}")
+                        asm.extend(store_val(dest, d_reg))
+
+                # Simple Assignment: x = y
+                elif len(parts) == 3:
+                    src = parts[2]
+                    r_s, lds = get_reg(src, TEMP1)
+                    asm.extend(lds)
+                    asm.extend(store_val(dest, r_s))
                 
-            elif len(parts) >= 5 and parts[1] == "=":
-                # x = y + z
-                if parts[2] == "call":
-                    arg, loads = get_read_op(parts[4], TEMP1)
-                    asm.extend(loads)
-                    asm.append(f"MOVE $a0, {arg}")
-                    asm.append(f"JAL {parts[3].replace(',','')}")
-                    
-                    stores = get_write_op(parts[0], "$v0")
-                    asm.extend(stores)
-                else:
-                    op_map = {'+': 'ADD', '-': 'SUB', '*': 'MUL', '/': 'DIV', '<': 'SLT', '>': 'SGT', '==': 'SEQ', '!=': 'SNE'}
-                    r_left, loads1 = get_read_op(parts[2], TEMP1)
-                    r_right, loads2 = get_read_op(parts[4], TEMP2)
-                    
-                    asm.extend(loads1)
-                    asm.extend(loads2)
-                    
-                    dest_reg = reg_map.get(parts[0], TEMP3)
-                    
-                    op = op_map.get(parts[3], f"OP_{parts[3]}")
-                    asm.append(f"{op} {dest_reg}, {r_left}, {r_right}")
-                    
-                    if parts[0] not in reg_map:
-                        asm.append(f"SW {dest_reg}, {parts[0]}")
-                    
-            elif len(parts) == 4 and parts[0] == "ifFalse":
-                # ifFalse cond goto L1
-                r_cond, loads = get_read_op(parts[1], TEMP1)
-                asm.extend(loads)
-                asm.append(f"BEQ {r_cond}, $zero, {parts[3]}")
-                
-            elif len(parts) == 2 and parts[0] == "goto":
-                asm.append(f"J {parts[1]}")
-                
-        return asm
+                # Function call: x = call f, arg
+                elif parts[2] == "call":
+                    r_arg, lds = get_reg(parts[4], TEMP1)
+                    asm.extend(lds)
+                    asm.append(f"  MOVE $a0, {r_arg}")
+                    asm.append(f"  JAL {parts[3].replace(',', '')}")
+                    asm.extend(store_val(dest, "$v0"))
+
+        # Program epilogue
+        asm.append("main_exit:")
+        if frame_size > 0:
+            asm.append(f"  ADDI $sp, $sp, {frame_size}")
+        asm.append("  LI $v0, 10")
+        asm.append("  syscall")
+        
+        # Division error path
+        asm.append("div_error:")
+        asm.append("  LI $v0, 10")
+        asm.append("  syscall")
+        
+        return self._peephole_optimize_asm(asm)
 
 
 def compile_code(source_code, k_regs=4):
@@ -1389,154 +1739,7 @@ def compile_code(source_code, k_regs=4):
     
     opt_tac = engine.optimize_tac()
     
-    # Update to use the parameterized 'k' for Graph Coloring
-    asm = []
-    allocator = GraphColoringAllocator(opt_tac, k=k_regs)
-    reg_map = allocator.allocate()
-    
-    asm.append(f"// --- Register Allocation (K={k_regs}) ---")
-    for v, r in reg_map.items():
-        if GraphColoringAllocator.is_valid_var(v):
-            asm.append(f"// {v} -> {r}")
-    if allocator.spilled:
-        valid_spilled = [s for s in allocator.spilled if GraphColoringAllocator.is_valid_var(s)]
-        if valid_spilled:
-            asm.append(f"// Spilled: {', '.join(valid_spilled)}")
-    asm.append("// ---------------------------")
-    
-    # Temp registers for spilled/constants
-    TEMP1 = "$t7"
-    TEMP2 = "$t8"
-    TEMP3 = "$t9"
-    
-    def get_read_op(v, t_reg):
-        try:
-            float(v)
-            return t_reg, [f"LI {t_reg}, {v}"]  # Load Immediate
-        except ValueError:
-            if v in reg_map:
-                return reg_map[v], []
-            else: # Spill Load
-                return t_reg, [f"LW {t_reg}, {v}"]
-                
-    def get_write_op(v, s_reg):
-        if v in reg_map:
-            if reg_map[v] != s_reg:
-                return [f"MOVE {reg_map[v]}, {s_reg}"]
-            return []
-        else:
-            return [f"SW {s_reg}, {v}"] # Spill Store
-
-    OUT = allocator.out_sets
-    val_constants = {}  # track compile-time constant values
-    div_label_num = 0
-
-    for i, line in enumerate(opt_tac):
-        line_clean = line.split("  //")[0].strip()
-        parts = line_clean.split(" ")
-
-        if line_clean.endswith(":"):
-            asm.append(line_clean)
-            val_constants.clear()
-
-        elif len(parts) == 3 and parts[1] == "=":
-            src, loads = get_read_op(parts[2], TEMP1)
-            asm.extend(loads)
-            stores = get_write_op(parts[0], src)
-            asm.extend(stores)
-            # Track constant value for folding
-            try:
-                val_constants[parts[0]] = float(parts[2])
-            except ValueError:
-                val_constants.pop(parts[0], None)
-
-        elif len(parts) >= 5 and parts[1] == "=":
-            if len(parts) >= 5 and parts[2] == "call":
-                arg, loads = get_read_op(parts[4], TEMP1)
-                asm.extend(loads)
-
-                # Caller-Save active $t variables across JAL
-                live_t_regs = set()
-                if i in OUT:
-                    for v in OUT[i]:
-                        if v in reg_map and reg_map[v].startswith("$t"):
-                            live_t_regs.add(reg_map[v])
-
-                # Push
-                for tr in live_t_regs:
-                    asm.append(f"ADDI $sp, $sp, -4")
-                    asm.append(f"SW {tr}, 0($sp)")
-
-                asm.append(f"MOVE $a0, {arg}")
-                asm.append(f"JAL {parts[3].replace(',','')}")
-
-                # Pop
-                for tr in reversed(list(live_t_regs)):
-                    asm.append(f"LW {tr}, 0($sp)")
-                    asm.append(f"ADDI $sp, $sp, 4")
-
-                stores = get_write_op(parts[0], "$v0")
-                asm.extend(stores)
-                val_constants.pop(parts[0], None)
-            else:
-                op_map = {'+': 'ADD', '-': 'SUB', '*': 'MUL', '/': 'DIV', '<': 'SLT', '>': 'SGT', '==': 'SEQ', '!=': 'SNE'}
-                r_left, loads1 = get_read_op(parts[2], TEMP1)
-                r_right, loads2 = get_read_op(parts[4], TEMP2)
-
-                asm.extend(loads1)
-                asm.extend(loads2)
-
-                dest_reg = reg_map.get(parts[0], TEMP3)
-                op = op_map.get(parts[3], f"OP_{parts[3]}")
-
-                # DIV: always runtime-safe — single consistent pattern
-                if op == 'DIV':
-                    div_label_num += 1
-                    div_lbl = f"DIV_ZERO_{div_label_num}"
-                    cont_lbl = f"DIV_CONT_{div_label_num}"
-                    den_reg = r_right
-                    asm.append(f"BEQ {den_reg}, $zero, {div_lbl}")
-                    asm.append(f"DIV {dest_reg}, {r_left}, {r_right}")
-                    asm.append(f"J {cont_lbl}")
-                    asm.append(f"{div_lbl}:")
-                    asm.append(f"LI {dest_reg}, 0")
-                    asm.append(f"{cont_lbl}:")
-                    if parts[0] not in reg_map:
-                        asm.append(f"SW {dest_reg}, {parts[0]}")
-                    val_constants.pop(parts[0], None)
-                    continue
-
-                asm.append(f"{op} {dest_reg}, {r_left}, {r_right}")
-
-                if parts[0] not in reg_map:
-                    asm.append(f"SW {dest_reg}, {parts[0]}")
-
-                # Track constant result for constant operands (for final forward fold)
-                try:
-                    left_val = float(parts[2])
-                    right_val = float(parts[4])
-                    if op == 'ADD': res = left_val + right_val
-                    elif op == 'SUB': res = left_val - right_val
-                    elif op == 'MUL': res = left_val * right_val
-                    elif op == 'SEQ': res = 1 if left_val == right_val else 0
-                    elif op == 'SNE': res = 1 if left_val != right_val else 0
-                    elif op == 'SLT': res = 1 if left_val < right_val else 0
-                    elif op == 'SGT': res = 1 if left_val > right_val else 0
-                    else: res = None
-                    if res is not None:
-                        val_constants[parts[0]] = res
-                except ValueError:
-                    val_constants.pop(parts[0], None)
-                
-        elif len(parts) == 4 and parts[0] == "ifFalse":
-            r_cond, loads = get_read_op(parts[1], TEMP1)
-            asm.extend(loads)
-            asm.append(f"BEQ {r_cond}, $zero, {parts[3]}")
-            val_constants.clear()
-
-        elif len(parts) == 2 and parts[0] == "goto":
-            asm.append(f"J {parts[1]}")
-            val_constants.clear()
+    asm = engine.generate_assembly(opt_tac, k_regs=k_regs)
     
     # Generate CFG mapping for Frontend Dagre-D3
     cfg = ControlFlowGraph(opt_tac)

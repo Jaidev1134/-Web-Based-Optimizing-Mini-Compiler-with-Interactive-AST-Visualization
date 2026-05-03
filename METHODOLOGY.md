@@ -12,11 +12,12 @@
 4. [Phase 3 — Semantic Analysis & TAC Generation](#4-phase-3--semantic-analysis--tac-generation)
 5. [Phase 4 — Control Flow Graph](#5-phase-4--control-flow-graph)
 6. [Phase 5 — Optimizations](#6-phase-5--optimizations)
-7. [Phase 6 — Register Allocation](#6-phase-6--register-allocation)
-8. [Phase 7 — Assembly Generation](#7-phase-7--assembly-generation)
-9. [Frontend Architecture](#8-frontend-architecture)
-10. [Complete Pipeline Flow](#9-complete-pipeline-flow)
-11. [Limitations & Future Work](#10-limitations--future-work)
+7. [Phase 6 — Register Allocation](#7-phase-6--register-allocation)
+8. [Phase 7 — Assembly Generation & Safety](#8-phase-7--assembly-generation--safety)
+9. [Stability & Correctness Guardrails](#9-stability--correctness-guardrails)
+10. [Frontend Architecture](#10-frontend-architecture)
+11. [Complete Pipeline Flow](#11-complete-pipeline-flow)
+12. [Limitations & Future Work](#12-limitations--future-work)
 
 ---
 
@@ -1276,14 +1277,14 @@ Frontend updates all tabs
 | `Program`, `Block`, `Assign`, etc. | ply_compiler.py | 75-162 | AST node types |
 | `yacc` parser | ply_compiler.py | 164-265 | Grammar + AST construction |
 | `BasicBlock` | ply_compiler.py | 270-275 | CFG block |
-| `ControlFlowGraph` | ply_compiler.py | 276-439 | CFG construction + dominators |
-| `LICMOptimizer` | ply_compiler.py | 441-533 | Loop-invariant code motion |
-| `GraphColoringAllocator` | ply_compiler.py | 535-653 | Register allocation |
-| `CompilerEngine` | ply_compiler.py | 677-802 | Semantic analysis + TAC generation |
-| TAC optimization functions | ply_compiler.py | 804-1143 | Individual optimization passes |
-| `optimize_tac` | ply_compiler.py | 1145-1187 | Optimization driver loop |
-| `MIPSEmitter` | ply_compiler.py | 1189-1401 | Assembly generation |
-| `compile_code` | ply_compiler.py | 1277-1444 | Main entry point |
+| `ControlFlowGraph` | ply_compiler.py | 276-464 | CFG construction + dominators |
+| `LICMOptimizer` | ply_compiler.py | 466-558 | Loop-invariant code motion |
+| `GraphColoringAllocator` | ply_compiler.py | 560-678 | Register allocation |
+| `CompilerEngine` | ply_compiler.py | 702-835 | Semantic analysis + TAC generation |
+| TAC optimization functions | ply_compiler.py | 840-1280 | Individual optimization passes |
+| `optimize_tac` | ply_compiler.py | 1285-1350 | Optimization driver loop |
+| `MIPSEmitter` | ply_compiler.py | 1450-1790 | Assembly generation |
+| `compile_code` | ply_compiler.py | 1700-1796 | Main entry point |
 
 ### Variable Naming Conventions
 
@@ -1292,5 +1293,52 @@ Frontend updates all tabs
 | `t0`, `t1`, … | Compiler-generated temporary | `t0 = a + b` |
 | `L0`, `L1`, … | Compiler-generated labels | `L0:` |
 | `B0`, `B1`, … | Basic block IDs | CFG nodes |
-| `$t0`-`$t6` | MIPS temp registers | Assembly |
-| `$s0`-`$sK-1` | MIPS saved registers | Assembly |
+| `$t0`-`$t5` | General purpose temporaries | Assembly |
+| `$t7`, `$t6` | Dedicated scratch registers | Assembler Safety |
+| `$s0`-`$sK-1` | MIPS saved registers | Register pool |
+
+---
+
+## 8. Phase 7 — Assembly Generation & Safety
+
+### Purpose
+
+Translate the optimized TAC into **MIPS-compatible assembly code**. This stage is where "Compiler Magic" meets "Hardware Reality."
+
+### Assembler Safety (Scratch Migration)
+
+A critical architectural decision was made to avoid the `$at` (Assembler Temporary) register. 
+- **Reserved Registers**: In standard MIPS, `$at` is reserved for the assembler. Using it directly can cause value corruption during pseudo-instruction expansion.
+- **Dedicated Scratch**: The compiler now uses `$t7` (Primary) and `$t6` (Secondary) as dedicated scratch registers. 
+- **Compute-Before-Use**: Every scratch use follows a strict load/compute cycle, preventing uninitialized data flow.
+
+### Relational Logic Support
+
+The backend supports the full relational operator set:
+- **<, >**: Direct `SLT` usage.
+- **<=, >=**: Implemented via `SLT` + `XORI 1` (logical inversion).
+- **==, !=**: Implemented via `SUB` and zero-comparison (`SLTIU 1` or `SLTU 0`).
+
+### Runtime Protections
+
+- **Division-by-Zero**: Every `DIV` instruction is preceded by a `BEQ reg, $zero, div_error` branch. If a program attempts to divide by zero, it immediately jumps to a safe error label, preventing hardware traps.
+
+---
+
+## 9. Stability & Correctness Guardrails
+
+### Safe DSE Shield
+
+Standard Dead Store Elimination (DSE) is often too aggressive, stripping variables that are used in control flow. Our **Safe Shield** implementation performs a downstream scan:
+- **Scan Phase**: Before removing `x = ...`, the compiler scans all downstream blocks.
+- **Usage Detection**: If `x` is found in an `ifFalse` condition, a `goto`, or a future block's `USE` set, it is marked as **LIVE** and preserved.
+
+### O(n) Stable Line Mapping
+
+To prevent stale analysis, the line-to-block mapping was redesigned:
+- **Original**: `O(n²)` string-based search (unstable, prone to duplicate collisions).
+- **Improved**: `O(n)` stable index-based builder. This ensures that liveness analysis and CFG management never fall out of sync.
+
+### Post-Optimization Integrity Validator
+
+A final `_validate_tac_integrity` pass runs after all optimizations. It detects "Use-before-Definition" errors, providing a safety net that warns the user if an optimization ever breaks the data-flow chain.
